@@ -1,5 +1,5 @@
 # Multi-Horizon Early Warning
-This repo contains the Pytorch implementation of the manuscript - [Dynamics-Augmented Multi-Horizon Early Warning for Extremely Rare Events in Industrial Processes]
+This is a companion repository and contains the Pytorch implementation of the manuscript - [Dynamics-Augmented Multi-Horizon Early Warning for Extremely Rare Events in Industrial Processes]
 
 <div align="center">
   <img src="imgs/fig.png" alt="main fig" width="80%">
@@ -44,10 +44,11 @@ representations across four predictive models.
 
 ## Citation
 ```
-@article{zhou2017reinforcevsumm, 
-   title={Deep Reinforcement Learning for Unsupervised Video Summarization with Diversity-Representativeness Reward},
-   author={Zhou, Kaiyang and Qiao, Yu and Xiang, Tao}, 
-   journal={arXiv:1801.00054}, 
-   year={2017} 
+@article{dyn_awr_2026,
+  title   = {Dynamics-Augmented Multi-Horizon Early Warning for Extremely Rare Events in Industrial Processes},
+  author  = {Anonymous Author(s)},
+  journal = {IEEE Access (under review)},
+  year    = {2026}
 }
 ```
+
