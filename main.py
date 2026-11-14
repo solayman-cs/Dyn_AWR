@@ -1,28 +1,5 @@
 #!/usr/bin/env python3
-"""ProcessMiner three-representation early-warning study (trimmed results version).
 
-Representations : raw, dynamics_only, dynamics_augmented
-Models          : HGB, XGBoost, LSTM, TCN
-Threshold       : operational-utility maximisation subject to time-under-alarm <= budget,
-                  selected on a dedicated chronological calibration split.
-
-This version runs exactly the same data loading, splits, feature construction,
-model training, threshold selection and test evaluation as v36, but saves ONLY:
-
-  <output>/seed_<s>/model_ablation_metrics.csv      observation + event metrics per
-                                                   model / representation / horizon
-  <output>/seed_<s>/test_predictions.csv           per-observation test probabilities,
-                                                   targets, thresholds and alarms
-  <output>/seed_<s>/threshold_policy_ablation.csv  four threshold policies on the test set
-  <output>/seed_<s>/complexity_efficiency_metrics.csv
-                                                   computational cost per component
-
-No figures and no other tables are written. All figures and paper tables are built
-afterwards from these files.
-
-The warning-model risk surrogate (_score_candidate_with_warning_surrogate) is kept
-in the code for the candidate-adjustment case study but is not executed here.
-"""
 
 from __future__ import annotations
 
@@ -78,10 +55,6 @@ else:
     TORCH_IMPORT_ERROR = None
 
 
-# Exact column-order mapping verified between the legacy ProcessMiner MTS CSV
-# (time, y, x1..x61) and the named ProcessMiner export over the shared
-# 18,398-observation benchmark interval. Renaming changes labels only; values,
-# splits, feature construction, models, thresholds, and evaluation remain unchanged.
 PROCESSMINER_X_TO_PHYSICAL = {
     "x1": "RSashScanAvg",
     "x2": "CT#1 BLADE PSI",
@@ -156,7 +129,6 @@ class Config:
     train_fraction: float = 0.60
     validation_fraction: float = 0.10
     threshold_calibration_fraction: float = 0.10
-    # Remaining 20% is untouched test data.
 
     rolling_windows: tuple[int, ...] = (5, 15, 30)
     vae_components: int = 6
@@ -194,7 +166,6 @@ class Config:
     enable_efficiency_analysis: bool = True
     enable_threshold_ablation: bool = True
 
-    # Used only by the (not executed) warning-model risk surrogate.
     advisory_model: str = "HGB"
     advisory_feature_setting: str = "dynamics_augmented"
 
@@ -221,19 +192,7 @@ def load_processminer_like_csv(
     include_eventpress: bool = True,
     named_data_window: str = "legacy",
 ) -> tuple[pd.DataFrame, list[str]]:
-    """Accept either the legacy manuscript CSV or the named ProcessMiner CSV.
-
-    Legacy format:
-        time, y, x1, x2, ..., x61
-
-    Named format:
-        DateTime, SheetBreak, <named process variables>, EventPress
-
-    The named format preserves the original numeric column order. EventPress is
-    included by default so the named-data experiment retains the same number of
-    process channels as the earlier x1..x61 experiment. It can be excluded
-    explicitly with --exclude-eventpress for a sensitivity analysis.
-    """
+   
     df = pd.read_csv(path)
 
     if {"time", "y"}.issubset(df.columns):
@@ -268,11 +227,7 @@ def load_processminer_like_csv(
         out = out[["time", "y"] + sensor_cols].copy()
         out = out.sort_values("time", kind="mergesort").reset_index(drop=True)
 
-        # IMPORTANT: the named CSV contains 20,458 observations through May 31,
-        # while the original public time/y/x1..x61 benchmark contains 18,398
-        # observations and ends at 1999-05-29 00:06. Recomputing 60/10/10/20
-        # chronological splits on the extended file changes the train/cal/test
-        # periods and therefore changes the Pareto operating points.
+      
         mode = str(named_data_window).strip().lower()
         if mode not in {"legacy", "full"}:
             raise ValueError("named_data_window must be either 'legacy' or 'full'.")
@@ -459,12 +414,6 @@ def choose_utility_threshold(
     fallback_records.sort(key=lambda row: row[:-2])
     *_, best_threshold, best_metrics = fallback_records[0]
     return float(best_threshold), best_metrics
-
-
-# -----------------------------------------------------------------------------
-# Threshold-policy ablation
-# -----------------------------------------------------------------------------
-
 
 def _candidate_thresholds(scores: np.ndarray, n_candidates: int) -> np.ndarray:
     finite = np.asarray(scores, dtype=float)
@@ -655,11 +604,6 @@ def threshold_policy_ablation_rows(
     return rows
 
 
-# -----------------------------------------------------------------------------
-# Computational-efficiency measurement
-# -----------------------------------------------------------------------------
-
-
 def _process_rss_mb() -> float:
     try:
         import psutil
@@ -669,11 +613,7 @@ def _process_rss_mb() -> float:
 
 
 class _PeakRSSMonitor:
-    """Sample process RSS during a bounded operation and report peak increase.
-
-    Unlike tracemalloc, RSS includes native-library and PyTorch CPU allocations, so it
-    is suitable for comparing HGB/XGBoost with LSTM/TCN on host memory.
-    """
+    
     def __init__(self, interval_sec: float = 0.02):
         self.interval_sec = float(interval_sec)
         self.baseline_mb = _process_rss_mb()
@@ -709,7 +649,7 @@ class _PeakRSSMonitor:
 
 
 def serialized_model_size_mb(model, kind: str) -> float:
-    """Approximate stored model size; useful for deployment comparison."""
+    
     try:
         if kind == "neural" and torch is not None:
             buf = io.BytesIO()
@@ -793,9 +733,6 @@ def efficiency_record(
     }
 
 
-# -----------------------------------------------------------------------------
-# Feature construction
-# -----------------------------------------------------------------------------
 
 
 class TabularVAE(nn.Module if nn is not None else object):
@@ -1017,8 +954,7 @@ def build_feature_sets(
     vae_features.index = base.index
     transform_state["vae"] = vae_state
 
-    # FTLE/local transition descriptors now use the nonlinear VAE latent trajectory.
-    ftle = causal_local_linear_ftle(
+        ftle = causal_local_linear_ftle(
         vae_latent_df.to_numpy(dtype=float),
         window=cfg.ftle_window, finite_horizon=cfg.ftle_horizon,
         stride=cfg.ftle_stride, ridge=cfg.ftle_ridge,
@@ -1031,10 +967,10 @@ def build_feature_sets(
         "reduced_ftle_derivative": "vae_reduced_ftle_derivative",
     })
 
-    # VAE-latent ablation retains absolute nonlinear latent state in addition to statistical features.
+   
     vae_latent_features = pd.concat([statistical, vae_latent_df, vae_features], axis=1)
 
-    # Dynamics-only excludes raw levels and absolute VAE coordinates.
+    
     dynamics_only = pd.concat([statistical_dynamics_only, vae_features, ftle], axis=1)
     dynamics_augmented = pd.concat([raw_tabular, dynamics_only], axis=1)
 
@@ -1047,10 +983,6 @@ def build_feature_sets(
     }
     return feature_sets, ftle, transform_state
 
-
-# -----------------------------------------------------------------------------
-# Classical models
-# -----------------------------------------------------------------------------
 
 
 def make_hgb(cfg: Config, seed_offset: int = 0) -> Pipeline:
@@ -1094,10 +1026,6 @@ def make_xgboost(cfg: Config, y_train: np.ndarray, seed_offset: int = 0):
         )),
     ])
 
-
-# -----------------------------------------------------------------------------
-# Neural sequence models
-# -----------------------------------------------------------------------------
 
 
 class SequenceDataset(Dataset):
@@ -1325,11 +1253,6 @@ def predict_neural(model, sequences: np.ndarray, cfg: Config) -> np.ndarray:
     return np.concatenate(outputs)
 
 
-# -----------------------------------------------------------------------------
-# Evaluation helpers
-# -----------------------------------------------------------------------------
-
-
 def observation_metrics(y_true: np.ndarray, scores: np.ndarray, threshold: float) -> dict[str, float]:
     pred = scores >= threshold
     return {
@@ -1363,12 +1286,11 @@ def feature_frame_for_sequence(
     feature_sets: dict[str, pd.DataFrame],
     raw_sensors: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Return channels for sequence models while avoiding obvious duplication."""
+   
     if feature_setting == "raw":
         return raw_sensors.copy()
     frame = feature_sets[feature_setting].copy()
-    # Sequence history already supplies lagged context. Remove explicit lag-1 and
-    # rolling-mean channels, but retain raw current state in dynamics_augmented.
+   
     keep = [c for c in frame.columns if not c.endswith("__lag1") and "__mean" not in c]
     return frame[keep]
 
@@ -1382,17 +1304,7 @@ def fit_sequence_preprocessor(frame: pd.DataFrame, train_idx: np.ndarray):
     return all_values, imputer, scaler
 
 
-# -----------------------------------------------------------------------------
-# Warning-model risk surrogate (kept for the candidate-adjustment case study;
-# not executed in this results-only version)
-# -----------------------------------------------------------------------------
 
-
-# Candidate process variables used only for the offline recommendation case study.
-# The public ProcessMiner data do not provide actuator/setpoint metadata, engineering
-# units, or admissible control limits. Therefore these tags are treated strictly as
-# candidate manipulable variables for predictive stress testing, not as validated
-# plant actuators or prescriptive control commands.
 DEFAULT_CANDIDATE_PROCESS_PARAMETERS = (
     "Clay Flow", "KraftFlow", "RetnAidFlo", "SilicaFlo", "SodAlumFlo",
     "CouchSpd", "MachSpd", "HorzSlcPos", "VertSlcPos", "HBxSlcTemp",
@@ -1401,12 +1313,7 @@ DEFAULT_CANDIDATE_PROCESS_PARAMETERS = (
 
 
 def _candidate_parameter_metadata(raw_sensors: pd.DataFrame, train_idx: np.ndarray) -> pd.DataFrame:
-    """Build train-only scaling/bound metadata for candidate process variables.
-
-    Candidate magnitudes are normalized by each variable's training-set IQR and
-    proposed values are restricted to the training 1st--99th percentile range.
-    This function does not infer actuator status or engineering safety limits.
-    """
+   
     train = raw_sensors.iloc[np.asarray(train_idx, dtype=int)]
     rows = []
     for name in DEFAULT_CANDIDATE_PROCESS_PARAMETERS:
@@ -1445,24 +1352,11 @@ def _score_candidate_with_warning_surrogate(
     feature_transform_state: dict,
     cfg: Config,
 ) -> tuple[float, dict[int, float]]:
-    """Evaluate a candidate adjustment with the already-fitted warning model.
-
-    No separate process-transition model is trained.  The selected advisory warning
-    model (HGB by default) is reused as a *risk surrogate*: the candidate parameter is
-    perturbed at the current observation, the exact feature-construction pipeline is
-    recomputed using the frozen train-only transform state, and the fitted horizon-
-    specific warning classifiers return counterfactual risk scores.
-
-    This is a local predictive sensitivity / consistency analysis.  It is not a
-    dynamical plant simulator and must not be interpreted as causal intervention
-    evidence or as a six-step physical process forecast.
-    """
     context = max(int(cfg.ftle_window) + 10, max(cfg.rolling_windows) + 10, cfg.sequence_length + 10)
     start = max(0, int(global_index) - context + 1)
     local_raw = raw_sensors.iloc[start:int(global_index) + 1].copy().reset_index(drop=True)
 
-    # Median-fill only the evaluated terminal state, matching the recommendation
-    # module's treatment of missing current measurements.
+   
     if len(local_raw) == 0:
         return np.nan, {int(h): np.nan for h in horizons}
     terminal = local_raw.iloc[-1].to_numpy(dtype=float)
@@ -1472,8 +1366,7 @@ def _score_candidate_with_warning_surrogate(
         terminal[int(parameter_index)] = float(adjusted_value)
     local_raw.iloc[-1, :] = terminal
 
-    # transform_state was fitted only on the original training partition.  Supplying
-    # it here prevents any refit on the intervention/test observation.
+    
     local_train_idx = np.arange(min(len(local_raw), max(3, len(local_raw) - 1)), dtype=int)
     local_feature_sets, _, _ = build_feature_sets(
         local_raw,
@@ -1506,11 +1399,6 @@ def _score_candidate_with_warning_surrogate(
         return np.nan, scores
     weighted = float(np.average(np.asarray(vals), weights=np.asarray(wts)))
     return weighted, scores
-
-
-# -----------------------------------------------------------------------------
-# Experiment
-# -----------------------------------------------------------------------------
 
 
 def run_experiment(cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -1731,7 +1619,7 @@ def run_experiment(cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame]:
                             peak_gpu_memory_mb=peak_gpu_memory_mb,
                         ))
 
-                # Primary threshold: operational utility under the alarm-time budget.
+                
                 cal_indices = splits["threshold_calibration"]
                 threshold, calibration_event_metrics = choose_utility_threshold(
                     score_by_split["threshold_calibration"],
