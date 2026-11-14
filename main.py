@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-
 from __future__ import annotations
 
 import argparse
@@ -22,6 +21,7 @@ import pandas as pd
 
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.impute import SimpleImputer
+from sklearn.linear_model import Ridge
 from sklearn.metrics import (
     average_precision_score,
     brier_score_loss,
@@ -30,12 +30,13 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
+from sklearn.neighbors import NearestNeighbors
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 try:
     from xgboost import XGBClassifier
-except Exception as exc:  # pragma: no cover
+except Exception as exc:
     XGBClassifier = None
     XGBOOST_IMPORT_ERROR = exc
 else:
@@ -45,7 +46,7 @@ try:
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader, Dataset
-except Exception as exc:  # pragma: no cover
+except Exception as exc:
     torch = None
     nn = None
     Dataset = object
@@ -168,6 +169,17 @@ class Config:
 
     advisory_model: str = "HGB"
     advisory_feature_setting: str = "dynamics_augmented"
+    surrogate_ridge_alpha: float = 1.0
+    surrogate_rollout_steps: int = 6
+    surrogate_support_lower_q: float = 0.005
+    surrogate_support_upper_q: float = 0.995
+    surrogate_knn_k: int = 10
+    surrogate_knn_quantile: float = 0.99
+    surrogate_candidate_alphas: tuple[float, ...] = (0.10, 0.25, 0.50)
+    surrogate_action_penalty: float = 0.03
+    surrogate_min_relative_reduction: float = 0.10
+    surrogate_horizons: tuple[int, ...] = (10, 20, 30, 50)
+    surrogate_horizon_weights: tuple[float, ...] = (0.40, 0.30, 0.20, 0.10)
 
     include_eventpress: bool = True
     named_data_window: str = "legacy"
@@ -192,7 +204,6 @@ def load_processminer_like_csv(
     include_eventpress: bool = True,
     named_data_window: str = "legacy",
 ) -> tuple[pd.DataFrame, list[str]]:
-   
     df = pd.read_csv(path)
 
     if {"time", "y"}.issubset(df.columns):
@@ -227,7 +238,6 @@ def load_processminer_like_csv(
         out = out[["time", "y"] + sensor_cols].copy()
         out = out.sort_values("time", kind="mergesort").reset_index(drop=True)
 
-      
         mode = str(named_data_window).strip().lower()
         if mode not in {"legacy", "full"}:
             raise ValueError("named_data_window must be either 'legacy' or 'full'.")
@@ -292,7 +302,6 @@ def chronological_splits(n: int, cfg: Config) -> dict[str, np.ndarray]:
 
 
 def future_event_target_within_split(y_split: np.ndarray, horizon: int) -> np.ndarray:
-    """Target at t is 1 when an event occurs in t+1,...,t+h within the same split."""
     out = np.full(len(y_split), np.nan, dtype=float)
     for t in range(len(y_split) - horizon):
         out[t] = float(np.any(y_split[t + 1:t + horizon + 1] == 1))
@@ -370,11 +379,6 @@ def choose_utility_threshold(
     horizon: int,
     cfg: Config,
 ) -> tuple[float, dict[str, float]]:
-    """Choose one threshold by utility maximization subject only to time-under-alarm <= budget.
-
-    False-alarm episodes/day remains part of the utility penalty, but it is NOT
-    used as a hard feasibility constraint.
-    """
     finite = np.isfinite(scores)
     if finite.sum() == 0:
         raise ValueError("No finite calibration scores available.")
@@ -395,13 +399,10 @@ def choose_utility_threshold(
         hit = metrics["EventHitRate"] if np.isfinite(metrics["EventHitRate"]) else -np.inf
         lead = metrics["MeanLeadObservations"] if np.isfinite(metrics["MeanLeadObservations"]) else -np.inf
 
-        # Single hard constraint: time under alarm <= 10% by default.
         if alarm_time <= cfg.max_time_under_alarm:
             key = (utility, hit, lead, -fa, -alarm_time)
             feasible_records.append((key, float(threshold), metrics))
 
-        # If no threshold satisfies the budget, choose the closest alarm-time
-        # operating point, then prefer higher utility/hit rate.
         violation = max(0.0, alarm_time - cfg.max_time_under_alarm)
         fallback_records.append(
             (violation, -utility, -hit, -lead, fa, alarm_time, float(threshold), metrics)
@@ -414,6 +415,7 @@ def choose_utility_threshold(
     fallback_records.sort(key=lambda row: row[:-2])
     *_, best_threshold, best_metrics = fallback_records[0]
     return float(best_threshold), best_metrics
+
 
 def _candidate_thresholds(scores: np.ndarray, n_candidates: int) -> np.ndarray:
     finite = np.asarray(scores, dtype=float)
@@ -429,7 +431,6 @@ def choose_max_f1_threshold(
     targets: np.ndarray,
     cfg: Config,
 ) -> float:
-    """Select a threshold maximizing observation-level F1 on calibration data."""
     scores = np.asarray(scores, dtype=float)
     targets = np.asarray(targets, dtype=int)
     finite = np.isfinite(scores)
@@ -457,7 +458,6 @@ def choose_hit_rate_budget_threshold(
     horizon: int,
     cfg: Config,
 ) -> tuple[float, dict[str, float]]:
-    """Maximize event hit rate subject only to Time Under Alarm <= configured budget."""
     finite = np.isfinite(scores)
     if finite.sum() == 0:
         raise ValueError("No finite calibration scores available.")
@@ -477,7 +477,6 @@ def choose_hit_rate_budget_threshold(
         utility = operational_utility(metrics, horizon, cfg)
 
         if alarm_time <= cfg.max_time_under_alarm:
-            # Hit rate is the primary objective; lead, utility and nuisance burden break ties.
             feasible.append(((hit, lead, utility, -fa, -alarm_time), float(threshold), metrics))
 
         violation = max(0.0, alarm_time - cfg.max_time_under_alarm)
@@ -502,7 +501,6 @@ def evaluate_threshold_on_split(
     horizon: int,
     cfg: Config,
 ) -> dict[str, float]:
-    """Evaluate one fixed threshold without any re-selection on the evaluated split."""
     alarm = np.zeros(len(original_y), dtype=bool)
     alarm[local_positions] = scores >= threshold
     event = event_metrics(original_y, alarm, times, horizon, cfg.event_merge_gap)
@@ -532,7 +530,6 @@ def threshold_policy_ablation_rows(
     splits: dict[str, np.ndarray],
     cfg: Config,
 ) -> list[dict]:
-    """Compare calibration-only threshold policies on the untouched test split."""
     cal_idx = splits["threshold_calibration"]
     test_idx = splits["test"]
     cal_y = y_original[cal_idx]
@@ -613,7 +610,6 @@ def _process_rss_mb() -> float:
 
 
 class _PeakRSSMonitor:
-    
     def __init__(self, interval_sec: float = 0.02):
         self.interval_sec = float(interval_sec)
         self.baseline_mb = _process_rss_mb()
@@ -649,7 +645,6 @@ class _PeakRSSMonitor:
 
 
 def serialized_model_size_mb(model, kind: str) -> float:
-    
     try:
         if kind == "neural" and torch is not None:
             buf = io.BytesIO()
@@ -733,10 +728,7 @@ def efficiency_record(
     }
 
 
-
-
 class TabularVAE(nn.Module if nn is not None else object):
-    """Compact VAE used only to learn nonlinear train-only latent process states."""
     def __init__(self, input_dim: int, hidden_dim: int, latent_dim: int):
         if nn is None:
             raise RuntimeError(f"PyTorch is unavailable: {TORCH_IMPORT_ERROR}")
@@ -774,12 +766,6 @@ def fit_or_apply_vae_features(
     cfg: Config,
     state: dict | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-    """Fit the VAE on train rows only, or reuse a previously fitted VAE state.
-
-    The posterior mean is the deterministic latent process state.  The returned
-    dynamic descriptors include coordinate-wise latent velocity/acceleration,
-    their norms, reconstruction error, and causal rolling summaries.
-    """
     if torch is None or nn is None:
         raise RuntimeError(
             "VAE dynamics require PyTorch. Install/use PyTorch or remove "
@@ -865,11 +851,6 @@ def causal_local_linear_ftle(
     stride: int,
     ridge: float,
 ) -> pd.DataFrame:
-    """Causal local-linear reduced-order FTLE approximation.
-
-    At evaluation time t, fit z_{k+1} ~= A_t z_k using only the preceding
-    window. The leading feature is log(sigma_max(A_t^H))/H.
-    """
     n, r = latent.shape
     ftle = np.full(n, np.nan)
     spectral_radius = np.full(n, np.nan)
@@ -911,11 +892,6 @@ def build_feature_sets(
     cfg: Config,
     transform_state: dict | None = None,
 ) -> tuple[dict[str, pd.DataFrame], pd.DataFrame, dict]:
-    """Construct raw, dynamics-only, dynamics-aware, and VAE ablation representations.
-
-    PCA is not used.  VAE fitting, imputation, and scaling use training rows only.
-    The local-linear FTLE/instability descriptors are computed in VAE latent space.
-    """
     base = raw_sensor_frame.astype(float).replace([np.inf, -np.inf], np.nan)
 
     current = base.copy(); current.columns = [f"{c}__current" for c in base.columns]
@@ -954,7 +930,7 @@ def build_feature_sets(
     vae_features.index = base.index
     transform_state["vae"] = vae_state
 
-        ftle = causal_local_linear_ftle(
+    ftle = causal_local_linear_ftle(
         vae_latent_df.to_numpy(dtype=float),
         window=cfg.ftle_window, finite_horizon=cfg.ftle_horizon,
         stride=cfg.ftle_stride, ridge=cfg.ftle_ridge,
@@ -967,10 +943,8 @@ def build_feature_sets(
         "reduced_ftle_derivative": "vae_reduced_ftle_derivative",
     })
 
-   
     vae_latent_features = pd.concat([statistical, vae_latent_df, vae_features], axis=1)
 
-    
     dynamics_only = pd.concat([statistical_dynamics_only, vae_features, ftle], axis=1)
     dynamics_augmented = pd.concat([raw_tabular, dynamics_only], axis=1)
 
@@ -982,7 +956,6 @@ def build_feature_sets(
         "vae_latent": vae_latent_features,
     }
     return feature_sets, ftle, transform_state
-
 
 
 def make_hgb(cfg: Config, seed_offset: int = 0) -> Pipeline:
@@ -1025,7 +998,6 @@ def make_xgboost(cfg: Config, y_train: np.ndarray, seed_offset: int = 0):
             random_state=cfg.random_seed + seed_offset,
         )),
     ])
-
 
 
 class SequenceDataset(Dataset):
@@ -1103,7 +1075,6 @@ class TCNClassifier(nn.Module):
         self.head = nn.Linear(hidden_size, 1)
 
     def forward(self, x):
-        # Input: batch, time, channels -> batch, channels, time
         z = self.network(x.transpose(1, 2))
         return self.head(z[:, :, -1]).squeeze(-1)
 
@@ -1115,7 +1086,6 @@ def make_sequences_for_split(
     original_y_split: np.ndarray,
     sequence_length: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Create strictly within-split sequences ending at eligible non-event t."""
     sequences: list[np.ndarray] = []
     targets: list[int] = []
     local_positions: list[int] = []
@@ -1126,7 +1096,6 @@ def make_sequences_for_split(
             continue
         global_t = split_indices[local_t]
         global_start = global_t - sequence_length + 1
-        # Strictly keep sequence inside the split.
         if global_start < split_indices[0]:
             continue
         seq = values[global_start:global_t + 1]
@@ -1286,11 +1255,9 @@ def feature_frame_for_sequence(
     feature_sets: dict[str, pd.DataFrame],
     raw_sensors: pd.DataFrame,
 ) -> pd.DataFrame:
-   
     if feature_setting == "raw":
         return raw_sensors.copy()
     frame = feature_sets[feature_setting].copy()
-   
     keep = [c for c in frame.columns if not c.endswith("__lag1") and "__mean" not in c]
     return frame[keep]
 
@@ -1304,109 +1271,195 @@ def fit_sequence_preprocessor(frame: pd.DataFrame, train_idx: np.ndarray):
     return all_values, imputer, scaler
 
 
-
 DEFAULT_CANDIDATE_PROCESS_PARAMETERS = (
     "Clay Flow", "KraftFlow", "RetnAidFlo", "SilicaFlo", "SodAlumFlo",
     "CouchSpd", "MachSpd", "HorzSlcPos", "VertSlcPos", "HBxSlcTemp",
 )
 
 
-
-def _candidate_parameter_metadata(raw_sensors: pd.DataFrame, train_idx: np.ndarray) -> pd.DataFrame:
-   
+def candidate_parameter_metadata(raw_sensors: pd.DataFrame, train_idx: np.ndarray, cfg: Config) -> pd.DataFrame:
     train = raw_sensors.iloc[np.asarray(train_idx, dtype=int)]
     rows = []
     for name in DEFAULT_CANDIDATE_PROCESS_PARAMETERS:
         if name not in raw_sensors.columns:
             continue
-        s = (
-            pd.to_numeric(train[name], errors="coerce")
-            .replace([np.inf, -np.inf], np.nan)
-            .dropna()
-        )
+        s = pd.to_numeric(train[name], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
         if len(s) < 20:
             continue
-        q01, q25, q75, q99 = s.quantile([0.01, 0.25, 0.75, 0.99]).to_numpy(dtype=float)
+        lo, q25, q75, hi = s.quantile([cfg.surrogate_support_lower_q, 0.25, 0.75, cfg.surrogate_support_upper_q]).to_numpy(dtype=float)
         iqr = float(q75 - q25)
         if not np.isfinite(iqr) or iqr <= 1e-12:
             continue
         rows.append({
             "Parameter": name,
-            "TrainQ01": float(q01),
-            "TrainQ25": float(q25),
-            "TrainQ75": float(q75),
-            "TrainQ99": float(q99),
+            "ParameterIndex": int(raw_sensors.columns.get_loc(name)),
+            "TrainLowerBound": float(lo),
+            "TrainUpperBound": float(hi),
             "TrainIQR": iqr,
-            "ControlStatus": "candidate_only_public_data_no_actuator_metadata",
         })
     return pd.DataFrame(rows)
 
 
-def _score_candidate_with_warning_surrogate(
-    raw_sensors: pd.DataFrame,
-    global_index: int,
-    parameter_index: int | None,
-    adjusted_value: float | None,
-    horizons: tuple[int, ...],
-    fitted_tree_models: dict,
-    feature_transform_state: dict,
-    cfg: Config,
-) -> tuple[float, dict[int, float]]:
-    context = max(int(cfg.ftle_window) + 10, max(cfg.rolling_windows) + 10, cfg.sequence_length + 10)
-    start = max(0, int(global_index) - context + 1)
-    local_raw = raw_sensors.iloc[start:int(global_index) + 1].copy().reset_index(drop=True)
+class ProcessTransitionSurrogate:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.imputer = SimpleImputer(strategy="median")
+        self.scaler = StandardScaler()
+        self.model = Ridge(alpha=cfg.surrogate_ridge_alpha)
+        self.knn = None
+        self.knn_threshold = np.nan
+        self.lower = None
+        self.upper = None
 
-   
-    if len(local_raw) == 0:
-        return np.nan, {int(h): np.nan for h in horizons}
-    terminal = local_raw.iloc[-1].to_numpy(dtype=float)
-    med = raw_sensors.iloc[: max(int(global_index), 1)].median(axis=0, skipna=True).to_numpy(dtype=float)
-    terminal = np.where(np.isfinite(terminal), terminal, med)
-    if parameter_index is not None and adjusted_value is not None:
-        terminal[int(parameter_index)] = float(adjusted_value)
-    local_raw.iloc[-1, :] = terminal
+    def _contiguous_mask(self, times: pd.Series, idx: np.ndarray) -> np.ndarray:
+        t = pd.to_datetime(times.iloc[idx]).reset_index(drop=True)
+        step = t.diff().dt.total_seconds().div(60.0)
+        nominal = float(step.mode().iloc[0]) if step.notna().any() else 0.0
+        ok = (step <= nominal + 1e-9).to_numpy().copy()
+        ok[0] = False
+        return ok
 
-    
-    local_train_idx = np.arange(min(len(local_raw), max(3, len(local_raw) - 1)), dtype=int)
-    local_feature_sets, _, _ = build_feature_sets(
-        local_raw,
-        local_train_idx,
-        cfg,
-        transform_state=feature_transform_state,
-    )
-    setting = cfg.advisory_feature_setting
-    score_row = local_feature_sets[setting].iloc[[-1]]
+    def fit(self, raw_sensors: pd.DataFrame, times: pd.Series, train_idx: np.ndarray) -> "ProcessTransitionSurrogate":
+        idx = np.asarray(train_idx, dtype=int)
+        x = self.scaler.fit_transform(self.imputer.fit_transform(raw_sensors.iloc[idx]))
+        ok = self._contiguous_mask(times, idx)
+        valid = np.flatnonzero(ok[1:-1] & ok[2:]) + 1
+        inputs = np.hstack([x[valid], x[valid - 1]])
+        targets = x[valid + 1]
+        self.model.fit(inputs, targets)
+        raw_train = raw_sensors.iloc[idx].astype(float)
+        self.lower = raw_train.quantile(self.cfg.surrogate_support_lower_q).to_numpy(dtype=float)
+        self.upper = raw_train.quantile(self.cfg.surrogate_support_upper_q).to_numpy(dtype=float)
+        k = int(self.cfg.surrogate_knn_k)
+        self.knn = NearestNeighbors(n_neighbors=k + 1).fit(x)
+        dist, _ = self.knn.kneighbors(x)
+        self.knn_threshold = float(np.quantile(dist[:, k], self.cfg.surrogate_knn_quantile))
+        return self
 
-    scores: dict[int, float] = {}
-    for h in horizons:
-        key = (cfg.advisory_model, setting, int(h))
-        model = fitted_tree_models.get(key)
-        if model is None:
-            scores[int(h)] = np.nan
-            continue
-        try:
-            scores[int(h)] = float(model.predict_proba(score_row)[:, 1][0])
-        except Exception:
-            scores[int(h)] = np.nan
+    def _to_scaled(self, raw_rows: np.ndarray) -> np.ndarray:
+        frame = pd.DataFrame(np.atleast_2d(raw_rows), columns=self.imputer.feature_names_in_)
+        return self.scaler.transform(self.imputer.transform(frame))
 
-    weights = {10: 0.40, 20: 0.30, 30: 0.20, 50: 0.10}
-    vals, wts = [], []
-    for h, value in scores.items():
-        if np.isfinite(value):
-            vals.append(value)
-            wts.append(weights.get(int(h), 1.0 / max(len(horizons), 1)))
-    if not vals:
-        return np.nan, scores
-    weighted = float(np.average(np.asarray(vals), weights=np.asarray(wts)))
-    return weighted, scores
+    def _to_raw(self, scaled_rows: np.ndarray) -> np.ndarray:
+        return self.scaler.inverse_transform(np.atleast_2d(scaled_rows))
+
+    def rollout(self, history_raw: np.ndarray, steps: int, fixed: dict[int, float] | None = None) -> np.ndarray:
+        fixed = fixed or {}
+        prev, cur = self._to_scaled(history_raw[-2:])
+        cur_raw = self._to_raw(cur)[0]
+        for j, value in fixed.items():
+            cur_raw[j] = value
+        cur = self._to_scaled(cur_raw)[0]
+        trajectory = []
+        for _ in range(int(steps)):
+            nxt = self.model.predict(np.hstack([cur, prev])[None, :])[0]
+            nxt_raw = self._to_raw(nxt)[0]
+            for j, value in fixed.items():
+                nxt_raw[j] = value
+            nxt = self._to_scaled(nxt_raw)[0]
+            trajectory.append(nxt_raw)
+            prev, cur = cur, nxt
+        return np.asarray(trajectory, dtype=float)
+
+    def in_support(self, states_raw: np.ndarray) -> bool:
+        states_raw = np.atleast_2d(states_raw)
+        finite = np.isfinite(self.lower) & np.isfinite(self.upper)
+        inside = ((states_raw[:, finite] >= self.lower[finite]) & (states_raw[:, finite] <= self.upper[finite])).all()
+        dist, _ = self.knn.kneighbors(self._to_scaled(states_raw), n_neighbors=int(self.cfg.surrogate_knn_k))
+        near = bool(np.all(dist[:, -1] <= self.knn_threshold))
+        return bool(inside and near)
+
+
+class CandidateRiskSurrogate:
+    def __init__(
+        self,
+        transition: ProcessTransitionSurrogate,
+        fitted_model_packs: dict,
+        feature_transform_state: dict,
+        cfg: Config,
+        model_name: str | None = None,
+        feature_setting: str | None = None,
+    ):
+        self.transition = transition
+        self.packs = fitted_model_packs
+        self.state = feature_transform_state
+        self.cfg = cfg
+        self.model_name = model_name or cfg.advisory_model
+        self.setting = feature_setting or cfg.advisory_feature_setting
+
+    def _horizon_probability(self, raw_window: pd.DataFrame, horizon: int) -> float:
+        pack = self.packs.get((self.model_name, self.setting, int(horizon)))
+        if pack is None:
+            return np.nan
+        train_idx = np.arange(min(len(raw_window), max(3, len(raw_window) - 1)), dtype=int)
+        feats, _, _ = build_feature_sets(raw_window, train_idx, self.cfg, transform_state=self.state)
+        if pack["kind"] == "tree":
+            return float(pack["model"].predict_proba(feats[self.setting].iloc[[-1]])[:, 1][0])
+        frame = feature_frame_for_sequence(self.setting, feats, raw_window)
+        values = pack["scaler"].transform(pack["imputer"].transform(frame)).astype(np.float32)
+        seq = values[-self.cfg.sequence_length:][None, :, :]
+        return float(predict_neural(pack["model"], seq, self.cfg)[0])
+
+    def weighted_risk(self, raw_sensors: pd.DataFrame, global_index: int, fixed: dict[int, float] | None = None) -> tuple[float, dict[int, float], np.ndarray]:
+        context = max(int(self.cfg.ftle_window) + 10, max(self.cfg.rolling_windows) + 10, self.cfg.sequence_length + 10)
+        start = max(0, int(global_index) - context + 1)
+        history = raw_sensors.iloc[start:int(global_index) + 1].astype(float)
+        history = history.fillna(history.median()).fillna(0.0)
+        trajectory = self.transition.rollout(history.to_numpy(), self.cfg.surrogate_rollout_steps, fixed)
+        window = pd.concat([history, pd.DataFrame(trajectory, columns=history.columns)], ignore_index=True)
+        probs = {int(h): self._horizon_probability(window, h) for h in self.cfg.surrogate_horizons}
+        weights = self.cfg.surrogate_horizon_weights
+        vals = [(p, w) for (h, p), w in zip(probs.items(), weights) if np.isfinite(p)]
+        if not vals:
+            return np.nan, probs, trajectory
+        p, w = np.asarray(vals, dtype=float).T
+        return float(np.average(p, weights=w)), probs, trajectory
+
+    def evaluate_candidates(self, raw_sensors: pd.DataFrame, global_index: int, metadata: pd.DataFrame) -> pd.DataFrame:
+        base_risk, base_probs, _ = self.weighted_risk(raw_sensors, global_index)
+        current = raw_sensors.iloc[int(global_index)].to_numpy(dtype=float)
+        rows = []
+        for _, meta in metadata.iterrows():
+            j = int(meta["ParameterIndex"])
+            for magnitude in self.cfg.surrogate_candidate_alphas:
+                for sign in (-1.0, 1.0):
+                    alpha = sign * float(magnitude)
+                    proposed = current[j] + alpha * float(meta["TrainIQR"])
+                    in_bounds = meta["TrainLowerBound"] <= proposed <= meta["TrainUpperBound"]
+                    post_risk, post_probs, trajectory = self.weighted_risk(raw_sensors, global_index, {j: proposed})
+                    supported = bool(in_bounds and self.transition.in_support(trajectory))
+                    reduction = base_risk - post_risk
+                    rho = reduction / (base_risk + 1e-8)
+                    objective = rho - self.cfg.surrogate_action_penalty * abs(alpha)
+                    row = {
+                        "GlobalIndex": int(global_index),
+                        "Parameter": meta["Parameter"],
+                        "AlphaIQR": alpha,
+                        "CurrentValue": float(current[j]),
+                        "ProposedValue": float(proposed),
+                        "BaselineWeightedRisk": base_risk,
+                        "PostAdjustmentWeightedRisk": post_risk,
+                        "AbsoluteRiskReduction": reduction,
+                        "RelativeRiskReduction": rho,
+                        "Objective": objective,
+                        "WithinTrainingSupport": supported,
+                        "Feasible": bool(supported and rho >= self.cfg.surrogate_min_relative_reduction),
+                    }
+                    for h in self.cfg.surrogate_horizons:
+                        row[f"Baseline_p{h}"] = base_probs.get(int(h), np.nan)
+                        row[f"PostAdjustment_p{h}"] = post_probs.get(int(h), np.nan)
+                    rows.append(row)
+        table = pd.DataFrame(rows)
+        if table.empty:
+            return table
+        table["Selected"] = False
+        feasible = table[table["Feasible"]]
+        if not feasible.empty:
+            table.loc[feasible["Objective"].idxmax(), "Selected"] = True
+        return table
 
 
 def run_experiment(cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Train/evaluate every model x representation x horizon for one seed.
-
-    Saves only: model_ablation_metrics.csv, test_predictions.csv,
-    threshold_policy_ablation.csv and complexity_efficiency_metrics.csv.
-    """
     set_seed(cfg.random_seed)
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1435,8 +1488,6 @@ def run_experiment(cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame]:
         named_data_window=cfg.named_data_window,
     )
 
-    # Legacy x1..x61 columns are relabelled with their physical tag names
-    # (labels only; values and column order are unchanged).
     if all(c in PROCESSMINER_X_TO_PHYSICAL for c in sensor_cols):
         used_names = [PROCESSMINER_X_TO_PHYSICAL[c] for c in sensor_cols]
     else:
@@ -1465,7 +1516,6 @@ def run_experiment(cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame]:
             sequence_frame = feature_frame_for_sequence(feature_setting, feature_sets, raw_sensors)
             sequence_values, _, _ = fit_sequence_preprocessor(sequence_frame, splits["train"])
 
-            # Prepare sequence data once per horizon and feature setting.
             sequence_data = {}
             for split_name, split_indices in splits.items():
                 y_split = y_original[split_indices]
@@ -1619,7 +1669,6 @@ def run_experiment(cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame]:
                             peak_gpu_memory_mb=peak_gpu_memory_mb,
                         ))
 
-                
                 cal_indices = splits["threshold_calibration"]
                 threshold, calibration_event_metrics = choose_utility_threshold(
                     score_by_split["threshold_calibration"],
@@ -1727,7 +1776,6 @@ def run_experiment(cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def run_repeated_seed_experiments(base_cfg: Config, seeds: tuple[int, ...]) -> None:
-    """Run the complete experiment independently for each seed (output_dir/seed_<s>/)."""
     seeds = tuple(dict.fromkeys(int(s) for s in seeds)) or (int(base_cfg.random_seed),)
     root = Path(base_cfg.output_dir)
     for i, seed in enumerate(seeds, start=1):

@@ -1,5 +1,5 @@
 # Multi-Horizon Early Warning
-This is a companion repository and contains the Pytorch implementation of the manuscript - [Dynamics-Augmented Multi-Horizon Early Warning for Extremely Rare Events in Industrial Processes]
+This is a companion repository which contains the Pytorch implementation of the manuscript - [Dynamics-Augmented Multi-Horizon Early Warning for Extremely Rare Events in Industrial Processes]
 
 <div align="center">
   <img src="imgs/fig.png" alt="main fig" width="80%">
